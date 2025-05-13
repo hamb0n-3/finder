@@ -5,13 +5,31 @@ edition = "2024"
 description = "A fast tool to search for keywords in files, folders, or file contents"
 
 [dependencies]
-clap = { version = "4.4", features = ["derive"] }  # Command line argument parsing
-walkdir = "2.4"  # Directory traversal
-grep-searcher = "0.1"  # Fast text search (from ripgrep)
-grep-matcher = "0.1"  # Pattern matching
-grep-regex = "0.1"  # Regex support
-ignore = "0.4"  # Respect .gitignore files
-anyhow = "1.0"  # Error handling
-rayon = "1.8"  # Parallel processing
-indicatif = "0.17"  # Progress bars
-regex = "1.10"  # Regular expressions
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+grep-matcher = "0.1" # For RegexMatcher, used by grep-searcher
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
+indicatif = "0.17"
+regex = "1.10"
+#rayon = "1.8" # We are using ignore's parallel walk, so direct rayon might not be strictly needed by main
+walkdir = "2.4" # Also potentially superseded by 'ignore' crate's WalkBuilder
+
+# New dependencies for performance
+caseless = "0.2"
+jemallocator = { version = "0.5", optional = true } # Optional, can be enabled via feature
+
+# Logging dependencies
+log = "0.4"
+env_logger = "0.10" # Using a recent version, adjust if needed
+
+[profile.release]
+lto = true
+strip = true # Reduces binary size
+codegen-units = 1 # Maximizes optimizations, but increases compile time
+panic = "abort" # Can slightly reduce binary size and might be faster if panics are not expected
+
+[features]
+default = []
+use-jemalloc = ["dep:jemallocator"] # Feature to enable jemallocator 
