@@ -1,0 +1,17 @@
+[package]
+name = "finder"
+version = "0.1.0"
+edition = "2024"
+description = "A fast tool to search for keywords in files, folders, or file contents"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }  # Command line argument parsing
+walkdir = "2.4"  # Directory traversal
+grep-searcher = "0.1"  # Fast text search (from ripgrep)
+grep-matcher = "0.1"  # Pattern matching
+grep-regex = "0.1"  # Regex support
+ignore = "0.4"  # Respect .gitignore files
+anyhow = "1.0"  # Error handling
+rayon = "1.8"  # Parallel processing
+indicatif = "0.17"  # Progress bars
+regex = "1.10"  # Regular expressions
