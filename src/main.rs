@@ -65,8 +65,6 @@ struct Config {
     max_depth: Option<usize>,
     #[arg(short, long, default_value_t = true)]
     progress: bool,
-    #[clap(skip)]
-    pattern_lowercase: Option<String>,
 
     /// Set the logging level.
     #[arg(long, value_enum, help = "Set the logging level (error, warn, info, debug, trace)")]
@@ -75,6 +73,8 @@ struct Config {
     /// Specify a file to write logs to. Defaults to stderr.
     #[arg(long, help = "Path to a file to write logs to (e.g., finder.log)")]
     log_file: Option<PathBuf>,
+    // name_regex_matcher is no longer part of Config
+    // name_regex_matcher: Option<Regex>, 
 }
 
 #[derive(Debug, Clone)]
@@ -149,10 +149,11 @@ fn main() -> Result<()> {
 
     let start_time = Instant::now();
 
-    if !config.regex && !config.case_sensitive {
-        config.pattern_lowercase = Some(config.pattern.to_lowercase());
-        debug!("Pre-computed lowercase pattern: {:?}", config.pattern_lowercase.as_ref().unwrap());
-    }
+    // Removed pre-computation of pattern_lowercase as it's no longer a field
+    // if !config.regex && !config.case_sensitive {
+    //     config.pattern_lowercase = Some(config.pattern.to_lowercase());
+    //     debug!("Pre-computed lowercase pattern: {:?}", config.pattern_lowercase.as_ref().unwrap());
+    // }
 
     info!(
         "Starting search for pattern '{}' in path '{}' (mode: {:?}, regex: {}, case_sensitive: {})",
@@ -191,17 +192,19 @@ fn main() -> Result<()> {
         walker.max_depth(Some(max_depth));
     }
 
-    let name_regex_matcher = if config.regex {
-        let pattern = if config.case_sensitive {
-            config.pattern.clone()
-        } else {
-            format!("(?i){}", config.pattern)
-        };
-        debug!("Compiled name regex pattern: {}", pattern);
-        Some(Regex::new(&pattern).context("Failed to compile name regex")?)
+    // Refactored name_matcher initialization
+    let pattern_str = if !config.regex {
+        regex::escape(&config.pattern)
     } else {
-        None
+        config.pattern.clone()
     };
+    let final_pattern_str = if !config.case_sensitive {
+        format!("(?i){}", pattern_str)
+    } else {
+        pattern_str
+    };
+    debug!("Compiled name regex pattern for name matching: {}", final_pattern_str);
+    let name_matcher = Regex::new(&final_pattern_str).context("Failed to compile name regex for names")?;
 
     let matches_arc = Arc::new(std::sync::Mutex::new(Vec::new()));
     let matches_clone_for_walker = Arc::clone(&matches_arc);
@@ -215,7 +218,7 @@ fn main() -> Result<()> {
         
         let config_ref = &config;
         let content_matcher_ref = &content_matcher;
-        let name_regex_matcher_ref = &name_regex_matcher;
+        let name_matcher_ref = &name_matcher; // Pass a reference to name_matcher
         let progress_bar_ref = &progress_bar;
 
         Box::new(move |result| {
@@ -240,7 +243,7 @@ fn main() -> Result<()> {
                     if search_dir_names && is_dir {
                         let path = entry.path();
                         if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                            if matches_name(config_ref, dir_name, name_regex_matcher_ref) {
+                            if matches_name(config_ref, dir_name, name_matcher_ref) { // Use name_matcher_ref
                                 debug!("Found directory match: {}", path.display());
                                 local_matches.push(Match {
                                     path: path.to_path_buf(),
@@ -255,7 +258,7 @@ fn main() -> Result<()> {
                     if search_file_names && is_file {
                         let path = entry.path();
                         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                            if matches_name(config_ref, file_name, name_regex_matcher_ref) {
+                            if matches_name(config_ref, file_name, name_matcher_ref) { // Use name_matcher_ref
                                 debug!("Found file name match: {}", path.display());
                                 local_matches.push(Match {
                                     path: path.to_path_buf(),
@@ -356,20 +359,13 @@ fn create_content_matcher(config: &Config) -> Result<RegexMatcher> {
     matcher.with_context(|| format!("Failed to create content matcher with pattern: '{}'", config.pattern))
 }
 
-fn matches_name(config: &Config, name_to_check: &str, name_regex_matcher: &Option<Regex>) -> bool {
-    trace!("Matching name: '{}' against pattern: '{}' (regex: {}, case_sensitive: {})", 
+fn matches_name(config: &Config, name_to_check: &str, name_matcher: &Regex) -> bool {
+    trace!("Matching name: '{}' against pattern built from: '{}' (regex: {}, case_sensitive: {})", 
            name_to_check, config.pattern, config.regex, config.case_sensitive);
-    if let Some(re) = name_regex_matcher {
-        re.is_match(name_to_check)
-    } else if config.case_sensitive {
-        name_to_check.contains(&config.pattern)
-    } else {
-        let pattern_for_caseless = config.pattern_lowercase.as_deref().unwrap_or(&config.pattern);
-        if pattern_for_caseless.is_empty() {
-            return name_to_check.is_empty();
-        }
-        name_to_check.chars().default_caseless_match(pattern_for_caseless.chars())
-    }
+    // name_matcher is now always a Regex, so we directly use it.
+    // The regex itself handles case sensitivity based on how it was constructed.
+    name_matcher.is_match(name_to_check)
+    // The previous logic for non-regex and case sensitivity is now handled by the construction of name_matcher's pattern
 }
 
 fn search_file_content(config: &Config, matcher: &RegexMatcher, path: &Path) -> Result<Vec<Match>> {
