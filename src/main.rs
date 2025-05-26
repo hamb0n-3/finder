@@ -21,6 +21,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use log::{info, warn, error, debug, trace, LevelFilter};
 use regex::Regex;
 use caseless::Caseless;
+use rusqlite::{Connection, Result as RusqliteResult}; 
 
 /// CLI Enum for specifying log levels
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -43,10 +44,16 @@ enum SearchMode {
     All,
 }
 
-/// Configuration for the finder program
+/// Enum representing the different subcommands
 #[derive(Parser, Debug)]
-#[command(author, version, about = "A fast file finder tool", long_about = None)]
-struct Config {
+enum SubCommand {
+    Search(SearchConfig),
+    Index(IndexConfig),
+}
+
+/// Configuration for the search subcommand
+#[derive(Parser, Debug)]
+struct SearchConfig {
     #[arg(required = true)]
     pattern: String,
     #[arg(default_value = ".")]
@@ -67,6 +74,26 @@ struct Config {
     progress: bool,
     #[clap(skip)]
     pattern_lowercase: Option<String>,
+    
+    #[arg(long, help = "Use the pre-built index for searching (experimental)")]
+    use_index: bool,
+}
+
+/// Configuration for the index subcommand
+#[derive(Parser, Debug)]
+struct IndexConfig {
+    #[arg(default_value = ".")]
+    path: PathBuf, // Path to the directory to index
+    #[arg(long, default_value = "finder.db")]
+    db_path: PathBuf, // Path to the SQLite database file
+}
+
+/// Configuration for the finder program
+#[derive(Parser, Debug)]
+#[command(author, version, about = "A fast file finder tool", long_about = None)]
+struct Config {
+    #[clap(subcommand)]
+    subcommand: SubCommand,
 
     /// Set the logging level.
     #[arg(long, value_enum, help = "Set the logging level (error, warn, info, debug, trace)")]
@@ -93,7 +120,7 @@ enum MatchType {
 }
 
 fn main() -> Result<()> {
-    let mut config = Config::parse();
+    let config = Config::parse();
 
     // Initialize logger
     let mut log_builder = env_logger::Builder::new();
@@ -114,60 +141,115 @@ fn main() -> Result<()> {
 
     // Set log target: file if specified, otherwise default (stderr)
     if let Some(log_file_path) = &config.log_file {
-        // Attempt to create/open the log file for appending
         match File::options().create(true).append(true).open(log_file_path) {
             Ok(file) => {
                 log_builder.target(env_logger::Target::Pipe(Box::new(file)));
-                // We can't use info! here yet as logger isn't fully initialized,
-                // but this will be logged once init() is called if level allows.
-                // Consider a simple println! for immediate feedback about log file if critical.
-                // println!("Logging to file: {}", log_file_path.display()); 
             }
             Err(e) => {
-                // If file can't be opened, log to stderr and continue with stderr logging for finder.
-                // Need to use eprintln! as logger is not yet initialized for file output.
                 eprintln!(
                     "Warning: Could not open log file '{}': {}. Logging to stderr instead.",
                     log_file_path.display(),
                     e
                 );
-                log_builder.target(env_logger::Target::Stderr); // Explicitly set to stderr
+                log_builder.target(env_logger::Target::Stderr);
             }
         }
     } else {
-        log_builder.target(env_logger::Target::Stderr); // Default to stderr if no file specified
+        log_builder.target(env_logger::Target::Stderr);
     }
 
-    log_builder.init(); // Initialize the logger with all configurations
+    log_builder.init();
 
-    info!("Finder application started");
-    if let Some(log_file_path) = &config.log_file {
-        // This info message will go to the file if successfully opened.
+    match config.subcommand {
+        SubCommand::Search(search_config) => {
+            run_search(search_config, &config)?;
+        }
+        SubCommand::Index(index_config) => {
+            // Call run_indexer
+            if let Err(e) = run_indexer(index_config) {
+                error!("Indexer failed: {}", e);
+                // Consider exiting with an error code if the indexer is critical
+                // std::process::exit(1); 
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn run_indexer(index_config: IndexConfig) -> Result<()> {
+    info!("Indexer started. Indexing path: '{}', Database: '{}'", 
+          index_config.path.display(), index_config.db_path.display());
+    let start_time = Instant::now();
+
+    // Create/open the SQLite database
+    let conn = Connection::open(&index_config.db_path)
+        .with_context(|| format!("Failed to open database at '{}'", index_config.db_path.display()))?;
+    
+    info!("Successfully opened database: {}", index_config.db_path.display());
+
+    // Create tables
+    // Table for files: stores file path and last modified time
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY,
+            path TEXT NOT NULL UNIQUE,
+            last_modified INTEGER NOT NULL
+        )",
+        [],
+    ).with_context(|| "Failed to create 'files' table")?;
+    info!("'files' table created or already exists.");
+
+    // Table for tokens: stores token and file_id (foreign key to files table)
+    // This assumes a simple tokenization strategy for now.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS tokens (
+            id INTEGER PRIMARY KEY,
+            token TEXT NOT NULL,
+            file_id INTEGER NOT NULL,
+            FOREIGN KEY (file_id) REFERENCES files (id)
+        )",
+        [],
+    ).with_context(|| "Failed to create 'tokens' table")?;
+    info!("'tokens' table created or already exists.");
+    
+    // Placeholder for actual indexing logic (Phase 3)
+    warn!("Actual file indexing logic is not yet implemented.");
+
+    let elapsed = start_time.elapsed();
+    info!("Indexer finished in {:.2}s. Database schema created.", elapsed.as_secs_f64());
+    Ok(())
+}
+
+// New function to encapsulate search logic
+fn run_search(mut search_config: SearchConfig, main_config: &Config) -> Result<()> {
+    info!("Finder application started (Search mode)");
+    if let Some(log_file_path) = &main_config.log_file {
         info!("Logging to file: {}", log_file_path.display());
     }
-    debug!("Parsed configuration: {:?}", config);
+    debug!("Parsed search configuration: {:?}", search_config);
 
     let start_time = Instant::now();
 
-    if !config.regex && !config.case_sensitive {
-        config.pattern_lowercase = Some(config.pattern.to_lowercase());
-        debug!("Pre-computed lowercase pattern: {:?}", config.pattern_lowercase.as_ref().unwrap());
+    if !search_config.regex && !search_config.case_sensitive {
+        search_config.pattern_lowercase = Some(search_config.pattern.to_lowercase());
+        debug!("Pre-computed lowercase pattern: {:?}", search_config.pattern_lowercase.as_ref().unwrap());
     }
 
     info!(
         "Starting search for pattern '{}' in path '{}' (mode: {:?}, regex: {}, case_sensitive: {})",
-        config.pattern,
-        config.path.display(),
-        config.mode,
-        config.regex,
-        config.case_sensitive
+        search_config.pattern,
+        search_config.path.display(),
+        search_config.mode,
+        search_config.regex,
+        search_config.case_sensitive
     );
 
-    let content_matcher = create_content_matcher(&config)?;
+    let content_matcher = create_content_matcher(&search_config)?;
     let processed_entry_count = Arc::new(AtomicUsize::new(0));
     let found_items_count_for_progress = Arc::new(AtomicUsize::new(0));
 
-    let progress_bar = if config.progress {
+    let progress_bar = if search_config.progress {
         let pb = ProgressBar::new_spinner();
         pb.set_style(
             ProgressStyle::default_spinner()
@@ -179,23 +261,23 @@ fn main() -> Result<()> {
         None
     };
 
-    let search_file_names = config.mode == SearchMode::FileName || config.mode == SearchMode::All;
-    let search_dir_names = config.mode == SearchMode::DirName || config.mode == SearchMode::All;
-    let search_contents = config.mode == SearchMode::Content || config.mode == SearchMode::All;
+    let search_file_names = search_config.mode == SearchMode::FileName || search_config.mode == SearchMode::All;
+    let search_dir_names = search_config.mode == SearchMode::DirName || search_config.mode == SearchMode::All;
+    let search_contents = search_config.mode == SearchMode::Content || search_config.mode == SearchMode::All;
 
-    let mut walker = WalkBuilder::new(&config.path);
+    let mut walker = WalkBuilder::new(&search_config.path);
     walker.standard_filters(true);
-    walker.follow_links(config.follow_links);
-    if let Some(max_depth) = config.max_depth {
+    walker.follow_links(search_config.follow_links);
+    if let Some(max_depth) = search_config.max_depth {
         debug!("Max search depth set to: {}", max_depth);
         walker.max_depth(Some(max_depth));
     }
 
-    let name_regex_matcher = if config.regex {
-        let pattern = if config.case_sensitive {
-            config.pattern.clone()
+    let name_regex_matcher = if search_config.regex {
+        let pattern = if search_config.case_sensitive {
+            search_config.pattern.clone()
         } else {
-            format!("(?i){}", config.pattern)
+            format!("(?i){}", search_config.pattern)
         };
         debug!("Compiled name regex pattern: {}", pattern);
         Some(Regex::new(&pattern).context("Failed to compile name regex")?)
@@ -213,7 +295,7 @@ fn main() -> Result<()> {
         let found_count_progress_in_thread = Arc::clone(&found_count_clone_for_walker);
         let processed_count_in_thread = Arc::clone(&processed_count_clone_for_walker);
         
-        let config_ref = &config;
+        let search_config_ref = &search_config; 
         let content_matcher_ref = &content_matcher;
         let name_regex_matcher_ref = &name_regex_matcher;
         let progress_bar_ref = &progress_bar;
@@ -240,7 +322,7 @@ fn main() -> Result<()> {
                     if search_dir_names && is_dir {
                         let path = entry.path();
                         if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                            if matches_name(config_ref, dir_name, name_regex_matcher_ref) {
+                            if matches_name(search_config_ref, dir_name, name_regex_matcher_ref) {
                                 debug!("Found directory match: {}", path.display());
                                 local_matches.push(Match {
                                     path: path.to_path_buf(),
@@ -255,7 +337,7 @@ fn main() -> Result<()> {
                     if search_file_names && is_file {
                         let path = entry.path();
                         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                            if matches_name(config_ref, file_name, name_regex_matcher_ref) {
+                            if matches_name(search_config_ref, file_name, name_regex_matcher_ref) {
                                 debug!("Found file name match: {}", path.display());
                                 local_matches.push(Match {
                                     path: path.to_path_buf(),
@@ -270,7 +352,7 @@ fn main() -> Result<()> {
                     if search_contents && is_file {
                         let path = entry.path();
                         debug!("Searching content in file: {}", path.display());
-                        match search_file_content(config_ref, content_matcher_ref, path) {
+                        match search_file_content(search_config_ref, content_matcher_ref, path) {
                             Ok(content_matches) => {
                                 if !content_matches.is_empty() {
                                     info!("Content match(es) found in file: {}", path.display());
@@ -341,30 +423,30 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn create_content_matcher(config: &Config) -> Result<RegexMatcher> {
-    let pattern_str = if config.regex {
-        config.pattern.clone()
+fn create_content_matcher(search_config: &SearchConfig) -> Result<RegexMatcher> {
+    let pattern_str = if search_config.regex {
+        search_config.pattern.clone()
     } else {
-        regex::escape(&config.pattern)
+        regex::escape(&search_config.pattern)
     };
     debug!("Content matcher regex pattern: {}", pattern_str);
-    let matcher = if config.case_sensitive {
+    let matcher = if search_config.case_sensitive {
         RegexMatcher::new(&pattern_str)
     } else {
         RegexMatcher::new_line_matcher(&format!("(?i){}", pattern_str))
     };
-    matcher.with_context(|| format!("Failed to create content matcher with pattern: '{}'", config.pattern))
+    matcher.with_context(|| format!("Failed to create content matcher with pattern: '{}'", search_config.pattern))
 }
 
-fn matches_name(config: &Config, name_to_check: &str, name_regex_matcher: &Option<Regex>) -> bool {
+fn matches_name(search_config: &SearchConfig, name_to_check: &str, name_regex_matcher: &Option<Regex>) -> bool {
     trace!("Matching name: '{}' against pattern: '{}' (regex: {}, case_sensitive: {})", 
-           name_to_check, config.pattern, config.regex, config.case_sensitive);
+           name_to_check, search_config.pattern, search_config.regex, search_config.case_sensitive);
     if let Some(re) = name_regex_matcher {
         re.is_match(name_to_check)
-    } else if config.case_sensitive {
-        name_to_check.contains(&config.pattern)
+    } else if search_config.case_sensitive {
+        name_to_check.contains(&search_config.pattern)
     } else {
-        let pattern_for_caseless = config.pattern_lowercase.as_deref().unwrap_or(&config.pattern);
+        let pattern_for_caseless = search_config.pattern_lowercase.as_deref().unwrap_or(&search_config.pattern);
         if pattern_for_caseless.is_empty() {
             return name_to_check.is_empty();
         }
@@ -372,10 +454,10 @@ fn matches_name(config: &Config, name_to_check: &str, name_regex_matcher: &Optio
     }
 }
 
-fn search_file_content(config: &Config, matcher: &RegexMatcher, path: &Path) -> Result<Vec<Match>> {
+fn search_file_content(search_config: &SearchConfig, matcher: &RegexMatcher, path: &Path) -> Result<Vec<Match>> {
     trace!("Searching content in: {}", path.display());
     let mut matches = Vec::new();
-    let binary_detection = if config.ignore_binary {
+    let binary_detection = if search_config.ignore_binary {
         BinaryDetection::quit(b'\0')
     } else {
         BinaryDetection::none()
