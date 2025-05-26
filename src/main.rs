@@ -7,9 +7,10 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::fs::{self, Metadata}; // For reading file content and metadata
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};    // For last modified time
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -21,7 +22,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use log::{info, warn, error, debug, trace, LevelFilter};
 use regex::Regex;
 use caseless::Caseless;
-use rusqlite::{Connection, Result as RusqliteResult}; 
+// Ensure relevant imports are present for the refined run_indexer
+use rusqlite::{Connection, Result as RusqliteResult, params, OptionalExtension}; 
 
 /// CLI Enum for specifying log levels
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -77,6 +79,8 @@ struct SearchConfig {
     
     #[arg(long, help = "Use the pre-built index for searching (experimental)")]
     use_index: bool,
+    #[arg(long, default_value = "finder.db", help = "Path to the SQLite database file to use for indexed search")]
+    db_path: PathBuf, // New field for specifying DB path for search
 }
 
 /// Configuration for the index subcommand
@@ -182,14 +186,11 @@ fn run_indexer(index_config: IndexConfig) -> Result<()> {
           index_config.path.display(), index_config.db_path.display());
     let start_time = Instant::now();
 
-    // Create/open the SQLite database
-    let conn = Connection::open(&index_config.db_path)
+    let mut conn = Connection::open(&index_config.db_path) // Make conn mutable for transactions
         .with_context(|| format!("Failed to open database at '{}'", index_config.db_path.display()))?;
-    
     info!("Successfully opened database: {}", index_config.db_path.display());
 
-    // Create tables
-    // Table for files: stores file path and last modified time
+    // Create tables (same as before)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY,
@@ -198,26 +199,159 @@ fn run_indexer(index_config: IndexConfig) -> Result<()> {
         )",
         [],
     ).with_context(|| "Failed to create 'files' table")?;
-    info!("'files' table created or already exists.");
 
-    // Table for tokens: stores token and file_id (foreign key to files table)
-    // This assumes a simple tokenization strategy for now.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS tokens (
             id INTEGER PRIMARY KEY,
             token TEXT NOT NULL,
             file_id INTEGER NOT NULL,
-            FOREIGN KEY (file_id) REFERENCES files (id)
+            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE -- Added ON DELETE CASCADE
         )",
         [],
     ).with_context(|| "Failed to create 'tokens' table")?;
-    info!("'tokens' table created or already exists.");
-    
-    // Placeholder for actual indexing logic (Phase 3)
-    warn!("Actual file indexing logic is not yet implemented.");
+    info!("Database tables created or already exist.");
 
+    let mut files_processed_count = 0;
+    let mut files_newly_indexed_count = 0;
+    let mut files_updated_count = 0;
+    let mut tokens_inserted_count = 0;
+
+    let tx = conn.transaction().with_context(|| "Failed to start database transaction")?;
+
+    let walker = WalkBuilder::new(&index_config.path);
+    // walker.standard_filters(true); // Consider user preference for this
+    // walker.follow_links(false); // Usually false for indexing to avoid cycles/redundancy
+
+    for result in walker.build() {
+        match result {
+            Ok(entry) => {
+                if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                    if entry.file_type().map_or(false, |ft| ft.is_dir()) && entry.path().is_dir() {
+                        // Log directory being processed, useful for tracking progress / debugging permission issues
+                        trace!("Processing directory for indexing: {}", entry.path().display());
+                    }
+                    continue; // Skip non-files (directories, symlinks if not followed, etc.)
+                }
+                
+                files_processed_count += 1;
+                let path = entry.path();
+
+                match fs::metadata(path) {
+                    Ok(metadata) => {
+                        let last_modified_secs = metadata.modified()
+                            .ok()
+                            .and_then(|st| st.duration_since(SystemTime::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+
+                        let path_str = path.to_string_lossy().into_owned();
+
+                        // Check if file exists in DB and if it's modified
+                        let existing_file_info: Option<(i64, i64)> = tx.query_row(
+                            "SELECT id, last_modified FROM files WHERE path = ?1",
+                            rusqlite::params![path_str],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        ).optional().with_context(|| format!("Failed to query existing file data for {}", path_str))?;
+
+                        let mut needs_reindexing = true;
+                        let mut existing_file_id: Option<i64> = None;
+
+                        if let Some((id, db_last_modified)) = existing_file_info {
+                            existing_file_id = Some(id);
+                            if db_last_modified >= last_modified_secs as i64 {
+                                needs_reindexing = false;
+                                trace!("File {} is already indexed and up-to-date. Skipping.", path_str);
+                            } else {
+                                debug!("File {} has been modified since last index. Re-indexing.", path_str);
+                                // Delete old tokens for this file before inserting new ones
+                                tx.execute("DELETE FROM tokens WHERE file_id = ?1", rusqlite::params![id])
+                                    .with_context(|| format!("Failed to delete old tokens for file ID {}", id))?;
+                                files_updated_count += 1;
+                            }
+                        } else {
+                            files_newly_indexed_count += 1;
+                        }
+
+                        if needs_reindexing {
+                            let file_id_to_use = match existing_file_id {
+                                Some(id) => {
+                                    // Update last_modified for the existing file entry
+                                    tx.execute("UPDATE files SET last_modified = ?1 WHERE id = ?2", rusqlite::params![last_modified_secs, id])
+                                        .with_context(|| format!("Failed to update last_modified for file ID {}", id))?;
+                                    id
+                                }
+                                None => {
+                                    // Insert new file entry
+                                    tx.execute(
+                                        "INSERT INTO files (path, last_modified) VALUES (?1, ?2)",
+                                        rusqlite::params![path_str, last_modified_secs],
+                                    ).with_context(|| format!("Failed to insert new file {}", path_str))?;
+                                    tx.last_insert_rowid()
+                                }
+                            };
+                            
+                            if existing_file_id.is_none() { // Only log "Indexed file" for truly new files
+                                debug!("Indexed file: {} (ID: {})", path_str, file_id_to_use);
+                            }
+
+
+                            match fs::read_to_string(path) {
+                                Ok(content) => {
+                                    let file_tokens: Vec<String> = content
+                                        .split_whitespace()
+                                        .map(|s| s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect::<String>())
+                                        .filter(|s| !s.is_empty() && s.len() > 1)
+                                        .collect();
+                                    
+                                    let mut current_file_tokens_inserted = 0;
+                                    for token_str in file_tokens {
+                                        // Consider INSERT OR IGNORE if token+file_id duplicates are possible and benign
+                                        match tx.execute(
+                                            "INSERT INTO tokens (token, file_id) VALUES (?1, ?2)",
+                                            rusqlite::params![token_str, file_id_to_use],
+                                        ) {
+                                            Ok(_) => current_file_tokens_inserted += 1,
+                                            Err(e) => warn!("Failed to insert token '{}' for file_id {}: {}", token_str, file_id_to_use, e),
+                                        }
+                                    }
+                                    tokens_inserted_count += current_file_tokens_inserted;
+                                    if current_file_tokens_inserted > 0 {
+                                        trace!("Inserted {} tokens for file {}", current_file_tokens_inserted, path_str);
+                                    }
+                                }
+                                Err(e) => {
+                                    // Log error but continue indexing other files.
+                                    // The file entry in 'files' table might exist without tokens if content is unreadable.
+                                    warn!("Failed to read content of {} for tokenization: {}. No tokens will be indexed for this file.", path.display(), e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to get metadata for {}: {}. Skipping file.", path.display(), e);
+                    }
+                }
+            }
+            Err(e) => {
+                // This error often indicates a problem with accessing a directory (e.g., permissions)
+                error!("Error walking directory for indexing (entry path: {}): {}. Subsequent entries in this directory might be missed.", 
+                       e.path().map_or_else(|| "unknown".to_string(), |p| p.display().to_string()), 
+                       e.io_error().map_or_else(|| "unknown IO error".to_string(), |ioe| ioe.to_string()));
+            }
+        }
+    }
+
+    tx.commit().with_context(|| "Failed to commit database transaction")?;
+    
     let elapsed = start_time.elapsed();
-    info!("Indexer finished in {:.2}s. Database schema created.", elapsed.as_secs_f64());
+    info!(
+        "Indexer finished in {:.2}s. Processed {} files. Newly indexed: {}. Updated: {}. Total tokens inserted: {}.", 
+        elapsed.as_secs_f64(),
+        files_processed_count,
+        files_newly_indexed_count,
+        files_updated_count,
+        tokens_inserted_count
+    );
     Ok(())
 }
 
