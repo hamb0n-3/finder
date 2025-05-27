@@ -99,6 +99,7 @@ struct Config {
     #[clap(subcommand)]
     subcommand: SubCommand,
 
+
     /// Set the logging level.
     #[arg(long, value_enum, help = "Set the logging level (error, warn, info, debug, trace)")]
     log_level: Option<LogLevelCli>,
@@ -106,6 +107,8 @@ struct Config {
     /// Specify a file to write logs to. Defaults to stderr.
     #[arg(long, help = "Path to a file to write logs to (e.g., finder.log)")]
     log_file: Option<PathBuf>,
+    // name_regex_matcher is no longer part of Config
+    // name_regex_matcher: Option<Regex>, 
 }
 
 #[derive(Debug, Clone)]
@@ -370,6 +373,7 @@ fn run_search(mut search_config: SearchConfig, main_config: &Config) -> Result<(
         debug!("Pre-computed lowercase pattern: {:?}", search_config.pattern_lowercase.as_ref().unwrap());
     }
 
+
     info!(
         "Starting search for pattern '{}' in path '{}' (mode: {:?}, regex: {}, case_sensitive: {})",
         search_config.pattern,
@@ -415,9 +419,17 @@ fn run_search(mut search_config: SearchConfig, main_config: &Config) -> Result<(
         };
         debug!("Compiled name regex pattern: {}", pattern);
         Some(Regex::new(&pattern).context("Failed to compile name regex")?)
+
     } else {
-        None
+        config.pattern.clone()
     };
+    let final_pattern_str = if !config.case_sensitive {
+        format!("(?i){}", pattern_str)
+    } else {
+        pattern_str
+    };
+    debug!("Compiled name regex pattern for name matching: {}", final_pattern_str);
+    let name_matcher = Regex::new(&final_pattern_str).context("Failed to compile name regex for names")?;
 
     let matches_arc = Arc::new(std::sync::Mutex::new(Vec::new()));
     let matches_clone_for_walker = Arc::clone(&matches_arc);
@@ -431,7 +443,7 @@ fn run_search(mut search_config: SearchConfig, main_config: &Config) -> Result<(
         
         let search_config_ref = &search_config; 
         let content_matcher_ref = &content_matcher;
-        let name_regex_matcher_ref = &name_regex_matcher;
+        let name_matcher_ref = &name_matcher; // Pass a reference to name_matcher
         let progress_bar_ref = &progress_bar;
 
         Box::new(move |result| {
@@ -457,6 +469,7 @@ fn run_search(mut search_config: SearchConfig, main_config: &Config) -> Result<(
                         let path = entry.path();
                         if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
                             if matches_name(search_config_ref, dir_name, name_regex_matcher_ref) {
+
                                 debug!("Found directory match: {}", path.display());
                                 local_matches.push(Match {
                                     path: path.to_path_buf(),
@@ -586,6 +599,7 @@ fn matches_name(search_config: &SearchConfig, name_to_check: &str, name_regex_ma
         }
         name_to_check.chars().default_caseless_match(pattern_for_caseless.chars())
     }
+
 }
 
 fn search_file_content(search_config: &SearchConfig, matcher: &RegexMatcher, path: &Path) -> Result<Vec<Match>> {
