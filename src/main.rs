@@ -7,9 +7,10 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::fs::{self, Metadata}; // For reading file content and metadata
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};    // For last modified time
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -21,6 +22,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use log::{info, warn, error, debug, trace, LevelFilter};
 use regex::Regex;
 use caseless::Caseless;
+// Ensure relevant imports are present for the refined run_indexer
+use rusqlite::{Connection, Result as RusqliteResult, params, OptionalExtension}; 
 
 /// CLI Enum for specifying log levels
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -43,10 +46,16 @@ enum SearchMode {
     All,
 }
 
-/// Configuration for the finder program
+/// Enum representing the different subcommands
 #[derive(Parser, Debug)]
-#[command(author, version, about = "A fast file finder tool", long_about = None)]
-struct Config {
+enum SubCommand {
+    Search(SearchConfig),
+    Index(IndexConfig),
+}
+
+/// Configuration for the search subcommand
+#[derive(Parser, Debug)]
+struct SearchConfig {
     #[arg(required = true)]
     pattern: String,
     #[arg(default_value = ".")]
@@ -65,6 +74,31 @@ struct Config {
     max_depth: Option<usize>,
     #[arg(short, long, default_value_t = true)]
     progress: bool,
+    #[clap(skip)]
+    pattern_lowercase: Option<String>,
+    
+    #[arg(long, help = "Use the pre-built index for searching (experimental)")]
+    use_index: bool,
+    #[arg(long, default_value = "finder.db", help = "Path to the SQLite database file to use for indexed search")]
+    db_path: PathBuf, // New field for specifying DB path for search
+}
+
+/// Configuration for the index subcommand
+#[derive(Parser, Debug)]
+struct IndexConfig {
+    #[arg(default_value = ".")]
+    path: PathBuf, // Path to the directory to index
+    #[arg(long, default_value = "finder.db")]
+    db_path: PathBuf, // Path to the SQLite database file
+}
+
+/// Configuration for the finder program
+#[derive(Parser, Debug)]
+#[command(author, version, about = "A fast file finder tool", long_about = None)]
+struct Config {
+    #[clap(subcommand)]
+    subcommand: SubCommand,
+
 
     /// Set the logging level.
     #[arg(long, value_enum, help = "Set the logging level (error, warn, info, debug, trace)")]
@@ -93,7 +127,7 @@ enum MatchType {
 }
 
 fn main() -> Result<()> {
-    let mut config = Config::parse();
+    let config = Config::parse();
 
     // Initialize logger
     let mut log_builder = env_logger::Builder::new();
@@ -114,61 +148,246 @@ fn main() -> Result<()> {
 
     // Set log target: file if specified, otherwise default (stderr)
     if let Some(log_file_path) = &config.log_file {
-        // Attempt to create/open the log file for appending
         match File::options().create(true).append(true).open(log_file_path) {
             Ok(file) => {
                 log_builder.target(env_logger::Target::Pipe(Box::new(file)));
-                // We can't use info! here yet as logger isn't fully initialized,
-                // but this will be logged once init() is called if level allows.
-                // Consider a simple println! for immediate feedback about log file if critical.
-                // println!("Logging to file: {}", log_file_path.display()); 
             }
             Err(e) => {
-                // If file can't be opened, log to stderr and continue with stderr logging for finder.
-                // Need to use eprintln! as logger is not yet initialized for file output.
                 eprintln!(
                     "Warning: Could not open log file '{}': {}. Logging to stderr instead.",
                     log_file_path.display(),
                     e
                 );
-                log_builder.target(env_logger::Target::Stderr); // Explicitly set to stderr
+                log_builder.target(env_logger::Target::Stderr);
             }
         }
     } else {
-        log_builder.target(env_logger::Target::Stderr); // Default to stderr if no file specified
+        log_builder.target(env_logger::Target::Stderr);
     }
 
-    log_builder.init(); // Initialize the logger with all configurations
+    log_builder.init();
 
-    info!("Finder application started");
-    if let Some(log_file_path) = &config.log_file {
-        // This info message will go to the file if successfully opened.
+    match config.subcommand {
+        SubCommand::Search(search_config) => {
+            run_search(search_config, &config)?;
+        }
+        SubCommand::Index(index_config) => {
+            // Call run_indexer
+            if let Err(e) = run_indexer(index_config) {
+                error!("Indexer failed: {}", e);
+                // Consider exiting with an error code if the indexer is critical
+                // std::process::exit(1); 
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn run_indexer(index_config: IndexConfig) -> Result<()> {
+    info!("Indexer started. Indexing path: '{}', Database: '{}'", 
+          index_config.path.display(), index_config.db_path.display());
+    let start_time = Instant::now();
+
+    let mut conn = Connection::open(&index_config.db_path) // Make conn mutable for transactions
+        .with_context(|| format!("Failed to open database at '{}'", index_config.db_path.display()))?;
+    info!("Successfully opened database: {}", index_config.db_path.display());
+
+    // Create tables (same as before)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY,
+            path TEXT NOT NULL UNIQUE,
+            last_modified INTEGER NOT NULL
+        )",
+        [],
+    ).with_context(|| "Failed to create 'files' table")?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS tokens (
+            id INTEGER PRIMARY KEY,
+            token TEXT NOT NULL,
+            file_id INTEGER NOT NULL,
+            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE -- Added ON DELETE CASCADE
+        )",
+        [],
+    ).with_context(|| "Failed to create 'tokens' table")?;
+    info!("Database tables created or already exist.");
+
+    let mut files_processed_count = 0;
+    let mut files_newly_indexed_count = 0;
+    let mut files_updated_count = 0;
+    let mut tokens_inserted_count = 0;
+
+    let tx = conn.transaction().with_context(|| "Failed to start database transaction")?;
+
+    let walker = WalkBuilder::new(&index_config.path);
+    // walker.standard_filters(true); // Consider user preference for this
+    // walker.follow_links(false); // Usually false for indexing to avoid cycles/redundancy
+
+    for result in walker.build() {
+        match result {
+            Ok(entry) => {
+                if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                    if entry.file_type().map_or(false, |ft| ft.is_dir()) && entry.path().is_dir() {
+                        // Log directory being processed, useful for tracking progress / debugging permission issues
+                        trace!("Processing directory for indexing: {}", entry.path().display());
+                    }
+                    continue; // Skip non-files (directories, symlinks if not followed, etc.)
+                }
+                
+                files_processed_count += 1;
+                let path = entry.path();
+
+                match fs::metadata(path) {
+                    Ok(metadata) => {
+                        let last_modified_secs = metadata.modified()
+                            .ok()
+                            .and_then(|st| st.duration_since(SystemTime::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+
+                        let path_str = path.to_string_lossy().into_owned();
+
+                        // Check if file exists in DB and if it's modified
+                        let existing_file_info: Option<(i64, i64)> = tx.query_row(
+                            "SELECT id, last_modified FROM files WHERE path = ?1",
+                            rusqlite::params![path_str],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        ).optional().with_context(|| format!("Failed to query existing file data for {}", path_str))?;
+
+                        let mut needs_reindexing = true;
+                        let mut existing_file_id: Option<i64> = None;
+
+                        if let Some((id, db_last_modified)) = existing_file_info {
+                            existing_file_id = Some(id);
+                            if db_last_modified >= last_modified_secs as i64 {
+                                needs_reindexing = false;
+                                trace!("File {} is already indexed and up-to-date. Skipping.", path_str);
+                            } else {
+                                debug!("File {} has been modified since last index. Re-indexing.", path_str);
+                                // Delete old tokens for this file before inserting new ones
+                                tx.execute("DELETE FROM tokens WHERE file_id = ?1", rusqlite::params![id])
+                                    .with_context(|| format!("Failed to delete old tokens for file ID {}", id))?;
+                                files_updated_count += 1;
+                            }
+                        } else {
+                            files_newly_indexed_count += 1;
+                        }
+
+                        if needs_reindexing {
+                            let file_id_to_use = match existing_file_id {
+                                Some(id) => {
+                                    // Update last_modified for the existing file entry
+                                    tx.execute("UPDATE files SET last_modified = ?1 WHERE id = ?2", rusqlite::params![last_modified_secs, id])
+                                        .with_context(|| format!("Failed to update last_modified for file ID {}", id))?;
+                                    id
+                                }
+                                None => {
+                                    // Insert new file entry
+                                    tx.execute(
+                                        "INSERT INTO files (path, last_modified) VALUES (?1, ?2)",
+                                        rusqlite::params![path_str, last_modified_secs],
+                                    ).with_context(|| format!("Failed to insert new file {}", path_str))?;
+                                    tx.last_insert_rowid()
+                                }
+                            };
+                            
+                            if existing_file_id.is_none() { // Only log "Indexed file" for truly new files
+                                debug!("Indexed file: {} (ID: {})", path_str, file_id_to_use);
+                            }
+
+
+                            match fs::read_to_string(path) {
+                                Ok(content) => {
+                                    let file_tokens: Vec<String> = content
+                                        .split_whitespace()
+                                        .map(|s| s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect::<String>())
+                                        .filter(|s| !s.is_empty() && s.len() > 1)
+                                        .collect();
+                                    
+                                    let mut current_file_tokens_inserted = 0;
+                                    for token_str in file_tokens {
+                                        // Consider INSERT OR IGNORE if token+file_id duplicates are possible and benign
+                                        match tx.execute(
+                                            "INSERT INTO tokens (token, file_id) VALUES (?1, ?2)",
+                                            rusqlite::params![token_str, file_id_to_use],
+                                        ) {
+                                            Ok(_) => current_file_tokens_inserted += 1,
+                                            Err(e) => warn!("Failed to insert token '{}' for file_id {}: {}", token_str, file_id_to_use, e),
+                                        }
+                                    }
+                                    tokens_inserted_count += current_file_tokens_inserted;
+                                    if current_file_tokens_inserted > 0 {
+                                        trace!("Inserted {} tokens for file {}", current_file_tokens_inserted, path_str);
+                                    }
+                                }
+                                Err(e) => {
+                                    // Log error but continue indexing other files.
+                                    // The file entry in 'files' table might exist without tokens if content is unreadable.
+                                    warn!("Failed to read content of {} for tokenization: {}. No tokens will be indexed for this file.", path.display(), e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to get metadata for {}: {}. Skipping file.", path.display(), e);
+                    }
+                }
+            }
+            Err(e) => {
+                // This error often indicates a problem with accessing a directory (e.g., permissions)
+                error!("Error walking directory for indexing (entry path: {}): {}. Subsequent entries in this directory might be missed.", 
+                       e.path().map_or_else(|| "unknown".to_string(), |p| p.display().to_string()), 
+                       e.io_error().map_or_else(|| "unknown IO error".to_string(), |ioe| ioe.to_string()));
+            }
+        }
+    }
+
+    tx.commit().with_context(|| "Failed to commit database transaction")?;
+    
+    let elapsed = start_time.elapsed();
+    info!(
+        "Indexer finished in {:.2}s. Processed {} files. Newly indexed: {}. Updated: {}. Total tokens inserted: {}.", 
+        elapsed.as_secs_f64(),
+        files_processed_count,
+        files_newly_indexed_count,
+        files_updated_count,
+        tokens_inserted_count
+    );
+    Ok(())
+}
+
+// New function to encapsulate search logic
+fn run_search(mut search_config: SearchConfig, main_config: &Config) -> Result<()> {
+    info!("Finder application started (Search mode)");
+    if let Some(log_file_path) = &main_config.log_file {
         info!("Logging to file: {}", log_file_path.display());
     }
-    debug!("Parsed configuration: {:?}", config);
+    debug!("Parsed search configuration: {:?}", search_config);
 
     let start_time = Instant::now();
 
-    // Removed pre-computation of pattern_lowercase as it's no longer a field
-    // if !config.regex && !config.case_sensitive {
-    //     config.pattern_lowercase = Some(config.pattern.to_lowercase());
-    //     debug!("Pre-computed lowercase pattern: {:?}", config.pattern_lowercase.as_ref().unwrap());
-    // }
+    if !search_config.regex && !search_config.case_sensitive {
+        search_config.pattern_lowercase = Some(search_config.pattern.to_lowercase());
+        debug!("Pre-computed lowercase pattern: {:?}", search_config.pattern_lowercase.as_ref().unwrap());
+    }
+
 
     info!(
         "Starting search for pattern '{}' in path '{}' (mode: {:?}, regex: {}, case_sensitive: {})",
-        config.pattern,
-        config.path.display(),
-        config.mode,
-        config.regex,
-        config.case_sensitive
+        search_config.pattern,
+        search_config.path.display(),
+        search_config.mode,
+        search_config.regex,
+        search_config.case_sensitive
     );
 
-    let content_matcher = create_content_matcher(&config)?;
+    let content_matcher = create_content_matcher(&search_config)?;
     let processed_entry_count = Arc::new(AtomicUsize::new(0));
     let found_items_count_for_progress = Arc::new(AtomicUsize::new(0));
 
-    let progress_bar = if config.progress {
+    let progress_bar = if search_config.progress {
         let pb = ProgressBar::new_spinner();
         pb.set_style(
             ProgressStyle::default_spinner()
@@ -180,21 +399,27 @@ fn main() -> Result<()> {
         None
     };
 
-    let search_file_names = config.mode == SearchMode::FileName || config.mode == SearchMode::All;
-    let search_dir_names = config.mode == SearchMode::DirName || config.mode == SearchMode::All;
-    let search_contents = config.mode == SearchMode::Content || config.mode == SearchMode::All;
+    let search_file_names = search_config.mode == SearchMode::FileName || search_config.mode == SearchMode::All;
+    let search_dir_names = search_config.mode == SearchMode::DirName || search_config.mode == SearchMode::All;
+    let search_contents = search_config.mode == SearchMode::Content || search_config.mode == SearchMode::All;
 
-    let mut walker = WalkBuilder::new(&config.path);
+    let mut walker = WalkBuilder::new(&search_config.path);
     walker.standard_filters(true);
-    walker.follow_links(config.follow_links);
-    if let Some(max_depth) = config.max_depth {
+    walker.follow_links(search_config.follow_links);
+    if let Some(max_depth) = search_config.max_depth {
         debug!("Max search depth set to: {}", max_depth);
         walker.max_depth(Some(max_depth));
     }
 
-    // Refactored name_matcher initialization
-    let pattern_str = if !config.regex {
-        regex::escape(&config.pattern)
+    let name_regex_matcher = if search_config.regex {
+        let pattern = if search_config.case_sensitive {
+            search_config.pattern.clone()
+        } else {
+            format!("(?i){}", search_config.pattern)
+        };
+        debug!("Compiled name regex pattern: {}", pattern);
+        Some(Regex::new(&pattern).context("Failed to compile name regex")?)
+
     } else {
         config.pattern.clone()
     };
@@ -216,7 +441,7 @@ fn main() -> Result<()> {
         let found_count_progress_in_thread = Arc::clone(&found_count_clone_for_walker);
         let processed_count_in_thread = Arc::clone(&processed_count_clone_for_walker);
         
-        let config_ref = &config;
+        let search_config_ref = &search_config; 
         let content_matcher_ref = &content_matcher;
         let name_matcher_ref = &name_matcher; // Pass a reference to name_matcher
         let progress_bar_ref = &progress_bar;
@@ -243,7 +468,8 @@ fn main() -> Result<()> {
                     if search_dir_names && is_dir {
                         let path = entry.path();
                         if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                            if matches_name(config_ref, dir_name, name_matcher_ref) { // Use name_matcher_ref
+                            if matches_name(search_config_ref, dir_name, name_regex_matcher_ref) {
+
                                 debug!("Found directory match: {}", path.display());
                                 local_matches.push(Match {
                                     path: path.to_path_buf(),
@@ -258,7 +484,7 @@ fn main() -> Result<()> {
                     if search_file_names && is_file {
                         let path = entry.path();
                         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                            if matches_name(config_ref, file_name, name_matcher_ref) { // Use name_matcher_ref
+                            if matches_name(search_config_ref, file_name, name_regex_matcher_ref) {
                                 debug!("Found file name match: {}", path.display());
                                 local_matches.push(Match {
                                     path: path.to_path_buf(),
@@ -273,7 +499,7 @@ fn main() -> Result<()> {
                     if search_contents && is_file {
                         let path = entry.path();
                         debug!("Searching content in file: {}", path.display());
-                        match search_file_content(config_ref, content_matcher_ref, path) {
+                        match search_file_content(search_config_ref, content_matcher_ref, path) {
                             Ok(content_matches) => {
                                 if !content_matches.is_empty() {
                                     info!("Content match(es) found in file: {}", path.display());
@@ -344,34 +570,42 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn create_content_matcher(config: &Config) -> Result<RegexMatcher> {
-    let pattern_str = if config.regex {
-        config.pattern.clone()
+fn create_content_matcher(search_config: &SearchConfig) -> Result<RegexMatcher> {
+    let pattern_str = if search_config.regex {
+        search_config.pattern.clone()
     } else {
-        regex::escape(&config.pattern)
+        regex::escape(&search_config.pattern)
     };
     debug!("Content matcher regex pattern: {}", pattern_str);
-    let matcher = if config.case_sensitive {
+    let matcher = if search_config.case_sensitive {
         RegexMatcher::new(&pattern_str)
     } else {
         RegexMatcher::new_line_matcher(&format!("(?i){}", pattern_str))
     };
-    matcher.with_context(|| format!("Failed to create content matcher with pattern: '{}'", config.pattern))
+    matcher.with_context(|| format!("Failed to create content matcher with pattern: '{}'", search_config.pattern))
 }
 
-fn matches_name(config: &Config, name_to_check: &str, name_matcher: &Regex) -> bool {
-    trace!("Matching name: '{}' against pattern built from: '{}' (regex: {}, case_sensitive: {})", 
-           name_to_check, config.pattern, config.regex, config.case_sensitive);
-    // name_matcher is now always a Regex, so we directly use it.
-    // The regex itself handles case sensitivity based on how it was constructed.
-    name_matcher.is_match(name_to_check)
-    // The previous logic for non-regex and case sensitivity is now handled by the construction of name_matcher's pattern
+fn matches_name(search_config: &SearchConfig, name_to_check: &str, name_regex_matcher: &Option<Regex>) -> bool {
+    trace!("Matching name: '{}' against pattern: '{}' (regex: {}, case_sensitive: {})", 
+           name_to_check, search_config.pattern, search_config.regex, search_config.case_sensitive);
+    if let Some(re) = name_regex_matcher {
+        re.is_match(name_to_check)
+    } else if search_config.case_sensitive {
+        name_to_check.contains(&search_config.pattern)
+    } else {
+        let pattern_for_caseless = search_config.pattern_lowercase.as_deref().unwrap_or(&search_config.pattern);
+        if pattern_for_caseless.is_empty() {
+            return name_to_check.is_empty();
+        }
+        name_to_check.chars().default_caseless_match(pattern_for_caseless.chars())
+    }
+
 }
 
-fn search_file_content(config: &Config, matcher: &RegexMatcher, path: &Path) -> Result<Vec<Match>> {
+fn search_file_content(search_config: &SearchConfig, matcher: &RegexMatcher, path: &Path) -> Result<Vec<Match>> {
     trace!("Searching content in: {}", path.display());
     let mut matches = Vec::new();
-    let binary_detection = if config.ignore_binary {
+    let binary_detection = if search_config.ignore_binary {
         BinaryDetection::quit(b'\0')
     } else {
         BinaryDetection::none()
