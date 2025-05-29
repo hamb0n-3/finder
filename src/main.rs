@@ -7,7 +7,7 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::fs::{self, Metadata}; // For reading file content and metadata
+use std::fs::{self}; // For reading file content and metadata, removed Metadata
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};    // For last modified time
@@ -21,9 +21,8 @@ use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{info, warn, error, debug, trace, LevelFilter};
 use regex::Regex;
-use caseless::Caseless;
 // Ensure relevant imports are present for the refined run_indexer
-use rusqlite::{Connection, Result as RusqliteResult, params, OptionalExtension}; 
+use rusqlite::{Connection, OptionalExtension}; // Removed Result as RusqliteResult, params
 
 /// CLI Enum for specifying log levels
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -54,7 +53,7 @@ enum SubCommand {
 }
 
 /// Configuration for the search subcommand
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 struct SearchConfig {
     #[arg(required = true)]
     pattern: String,
@@ -168,8 +167,8 @@ fn main() -> Result<()> {
     log_builder.init();
 
     match config.subcommand {
-        SubCommand::Search(search_config) => {
-            run_search(search_config, &config)?;
+        SubCommand::Search(ref search_config) => {
+            run_search(search_config.clone(), &config)?;
         }
         SubCommand::Index(index_config) => {
             // Call run_indexer
@@ -337,9 +336,28 @@ fn run_indexer(index_config: IndexConfig) -> Result<()> {
             }
             Err(e) => {
                 // This error often indicates a problem with accessing a directory (e.g., permissions)
-                error!("Error walking directory for indexing (entry path: {}): {}. Subsequent entries in this directory might be missed.", 
-                       e.path().map_or_else(|| "unknown".to_string(), |p| p.display().to_string()), 
-                       e.io_error().map_or_else(|| "unknown IO error".to_string(), |ioe| ioe.to_string()));
+                // Extract path information from ignore::Error if available.
+                // This helps in identifying which file or directory caused the issue during the walk.
+                let path_display_str = match &e {
+                    // Correctly destructure WithPath to get the path.
+                    ignore::Error::WithPath { path, .. } => path.display().to_string(),
+                    // For loop errors, the 'child' path is often the problematic one.
+                    ignore::Error::Loop { child, .. } => child.display().to_string(),
+                    // For other error types from the 'ignore' crate,
+                    // a specific entry path might not be directly available in the error variant,
+                    // or it might be nested. "unknown path" is used as a fallback,
+                    // and the full error string from e.to_string() will provide more context.
+                    // The Io variant (ignore::Error::Io(std_io_error)) doesn't directly give us a path here.
+                    // If an Io error is path-specific, 'ignore' usually wraps it in WithPath.
+                    _ => "unknown path".to_string(),
+                };
+
+                // Log the full error details. e.to_string() provides a comprehensive message from the 'ignore' crate.
+                error!(
+                    "Error walking directory for indexing (entry path: {}): {}. Subsequent entries in this directory might be missed.",
+                    path_display_str,
+                    e.to_string() // This provides the full context of the ignore::Error
+                );
             }
         }
     }
@@ -411,25 +429,17 @@ fn run_search(mut search_config: SearchConfig, main_config: &Config) -> Result<(
         walker.max_depth(Some(max_depth));
     }
 
-    let name_regex_matcher = if search_config.regex {
+    let name_matcher: Option<Regex> = if search_config.regex {
         let pattern = if search_config.case_sensitive {
             search_config.pattern.clone()
         } else {
             format!("(?i){}", search_config.pattern)
         };
-        debug!("Compiled name regex pattern: {}", pattern);
-        Some(Regex::new(&pattern).context("Failed to compile name regex")?)
-
+        debug!("Compiled name regex pattern for names: {}", pattern);
+        Some(Regex::new(&pattern).context("Failed to compile name regex for names")?)
     } else {
-        config.pattern.clone()
+        None
     };
-    let final_pattern_str = if !config.case_sensitive {
-        format!("(?i){}", pattern_str)
-    } else {
-        pattern_str
-    };
-    debug!("Compiled name regex pattern for name matching: {}", final_pattern_str);
-    let name_matcher = Regex::new(&final_pattern_str).context("Failed to compile name regex for names")?;
 
     let matches_arc = Arc::new(std::sync::Mutex::new(Vec::new()));
     let matches_clone_for_walker = Arc::clone(&matches_arc);
@@ -443,7 +453,7 @@ fn run_search(mut search_config: SearchConfig, main_config: &Config) -> Result<(
         
         let search_config_ref = &search_config; 
         let content_matcher_ref = &content_matcher;
-        let name_matcher_ref = &name_matcher; // Pass a reference to name_matcher
+        let name_matcher_ref = &name_matcher;
         let progress_bar_ref = &progress_bar;
 
         Box::new(move |result| {
@@ -468,7 +478,7 @@ fn run_search(mut search_config: SearchConfig, main_config: &Config) -> Result<(
                     if search_dir_names && is_dir {
                         let path = entry.path();
                         if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                            if matches_name(search_config_ref, dir_name, name_regex_matcher_ref) {
+                            if matches_name(search_config_ref, dir_name, name_matcher_ref) {
 
                                 debug!("Found directory match: {}", path.display());
                                 local_matches.push(Match {
@@ -484,7 +494,7 @@ fn run_search(mut search_config: SearchConfig, main_config: &Config) -> Result<(
                     if search_file_names && is_file {
                         let path = entry.path();
                         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                            if matches_name(search_config_ref, file_name, name_regex_matcher_ref) {
+                            if matches_name(search_config_ref, file_name, name_matcher_ref) {
                                 debug!("Found file name match: {}", path.display());
                                 local_matches.push(Match {
                                     path: path.to_path_buf(),
@@ -577,29 +587,45 @@ fn create_content_matcher(search_config: &SearchConfig) -> Result<RegexMatcher> 
         regex::escape(&search_config.pattern)
     };
     debug!("Content matcher regex pattern: {}", pattern_str);
-    let matcher = if search_config.case_sensitive {
+    let created_matcher = if search_config.case_sensitive {
         RegexMatcher::new(&pattern_str)
     } else {
         RegexMatcher::new_line_matcher(&format!("(?i){}", pattern_str))
     };
-    matcher.with_context(|| format!("Failed to create content matcher with pattern: '{}'", search_config.pattern))
+    created_matcher.with_context(|| format!("Failed to create content matcher with pattern: '{}'", search_config.pattern))
 }
 
 fn matches_name(search_config: &SearchConfig, name_to_check: &str, name_regex_matcher: &Option<Regex>) -> bool {
     trace!("Matching name: '{}' against pattern: '{}' (regex: {}, case_sensitive: {})", 
            name_to_check, search_config.pattern, search_config.regex, search_config.case_sensitive);
-    if let Some(re) = name_regex_matcher {
-        re.is_match(name_to_check)
-    } else if search_config.case_sensitive {
-        name_to_check.contains(&search_config.pattern)
-    } else {
-        let pattern_for_caseless = search_config.pattern_lowercase.as_deref().unwrap_or(&search_config.pattern);
-        if pattern_for_caseless.is_empty() {
-            return name_to_check.is_empty();
-        }
-        name_to_check.chars().default_caseless_match(pattern_for_caseless.chars())
-    }
 
+    if search_config.regex {
+        match name_regex_matcher {
+            Some(re) => re.is_match(name_to_check),
+            None => {
+                warn!("Regex mode is on, but no compiled regex matcher was provided for name matching. Pattern: '{}'", search_config.pattern);
+                false
+            }
+        }
+    } else {
+        if search_config.case_sensitive {
+            name_to_check.contains(&search_config.pattern)
+        } else {
+            match &search_config.pattern_lowercase {
+                Some(lower_pattern) => {
+                    if lower_pattern.is_empty() {
+                        name_to_check.is_empty()
+                    } else {
+                        name_to_check.to_lowercase().contains(lower_pattern)
+                    }
+                }
+                None => {
+                    warn!("Case-insensitive non-regex search attempted, but lowercase pattern was not pre-computed. Original pattern: '{}'", search_config.pattern);
+                    name_to_check.to_lowercase().contains(&search_config.pattern.to_lowercase())
+                }
+            }
+        }
+    }
 }
 
 fn search_file_content(search_config: &SearchConfig, matcher: &RegexMatcher, path: &Path) -> Result<Vec<Match>> {
