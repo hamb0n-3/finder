@@ -324,7 +324,7 @@ fn run_indexer(index_config: IndexConfig) -> Result<()> {
                                 Err(e) => {
                                     // Log error but continue indexing other files.
                                     // The file entry in 'files' table might exist without tokens if content is unreadable.
-                                    warn!("Failed to read content of {} for tokenization: {}. No tokens will be indexed for this file.", path.display(), e);
+                                    debug!("Failed to read content of {} for tokenization: {}. No tokens will be indexed for this file.", path.display(), e);
                                 }
                             }
                         }
